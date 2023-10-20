@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"fmt"
+	"github.com/kumahq/kuma/pkg/core/policy"
 	"net"
 	"sort"
 	"strings"
@@ -142,7 +143,8 @@ func generatedHostname(meta model.ResourceMeta, suffix string) string {
 	return fmt.Sprintf("internal.%s.%s.%s", meta.GetName(), meta.GetMesh(), suffix)
 }
 
-func addFromMeshGateway(outboundSet *vips.VirtualOutboundMeshView, dnsSuffix, mesh string, gateway *core_mesh.MeshGatewayResource) {
+func addFromMeshGateway(outboundSet *vips.VirtualOutboundMeshView, dnsSuffix, mesh string, gateway *core_mesh.MeshGatewayResource,
+	gatewayRoutes core_mesh.MeshGatewayRouteResourceList, dataplanes core_mesh.DataplaneResourceList) {
 	for i, listener := range gateway.Spec.Conf.Listeners {
 		// We only setup outbounds for cross mesh listeners and only ones with a
 		// concrete hostname.
@@ -150,12 +152,25 @@ func addFromMeshGateway(outboundSet *vips.VirtualOutboundMeshView, dnsSuffix, me
 			continue
 		}
 
-		hostname := listener.Hostname
+		var hostnames []string
+		if listener.Hostname == "" || strings.Contains(listener.Hostname, "*") {
+			for _, proxyTags := range getProxyTagSets(gateway, dataplanes.Items) {
+				tags := mesh_proto.Merge(
+					gateway.Spec.GetTags(),
+					listener.GetTags(),
+					proxyTags,
+				)
+				Log.Info("match tags", "mesh", mesh, "gateway", gateway.GetMeta().GetName(), "tags", tags)
+				hostnames = append(hostnames, getRouteHostnamesForListener(gatewayRoutes.Items, listener, tags)...)
+			}
 
-		if hostname == "" || strings.Contains(hostname, "*") {
-			hostname = generatedHostname(gateway.GetMeta(), dnsSuffix)
+			// No routes define hostnames so use the default
+			if len(hostnames) == 0 {
+				hostnames = append(hostnames, generatedHostname(gateway.GetMeta(), dnsSuffix))
+			}
+		} else {
+			hostnames = append(hostnames, listener.Hostname)
 		}
-
 		// We only allow one selector with a crossMesh listener
 		for _, selector := range gateway.Spec.Selectors {
 			tags := mesh_proto.Merge(
@@ -166,18 +181,56 @@ func addFromMeshGateway(outboundSet *vips.VirtualOutboundMeshView, dnsSuffix, me
 				},
 				selector.GetMatch(),
 			)
-			origin := vips.OriginGateway(mesh, gateway.GetMeta().GetName(), hostname)
-			entry := vips.OutboundEntry{
-				Port:   listener.Port,
-				TagSet: tags,
-				Origin: origin,
-			}
-			if err := outboundSet.Add(vips.NewFqdnEntry(hostname), entry); err != nil {
-				Log.WithValues("mesh", mesh, "gateway", gateway.GetMeta().GetName(), "listener", i).
-					Info("failed to add MeshGateway-generated outbound", "reason", err.Error())
+			for _, hostname := range hostnames {
+				origin := vips.OriginGateway(mesh, gateway.GetMeta().GetName(), hostname)
+				entry := vips.OutboundEntry{
+					Port:   listener.Port,
+					TagSet: tags,
+					Origin: origin,
+				}
+				if err := outboundSet.Add(vips.NewFqdnEntry(hostname), entry); err != nil {
+					Log.WithValues("mesh", mesh, "gateway", gateway.GetMeta().GetName(), "listener", i).
+						Info("failed to add MeshGateway-generated outbound", "reason", err.Error())
+				}
 			}
 		}
 	}
+}
+
+func getProxyTagSets(gateway *core_mesh.MeshGatewayResource, dataplanes []*core_mesh.DataplaneResource) []map[string]string {
+	var tagSets []map[string]string
+	for _, dp := range dataplanes {
+		if _, ok := policy.MatchSelector(dp.Spec.GetNetworking().GetGateway().GetTags(), gateway.Selectors()); !ok {
+			continue
+		}
+		if dp.Spec.GetNetworking().GetGateway().GetType() == mesh_proto.Dataplane_Networking_Gateway_BUILTIN {
+			tagSets = append(tagSets, dp.Spec.GetNetworking().GetGateway().GetTags())
+		}
+	}
+	return tagSets
+}
+
+func getRouteHostnamesForListener(gatewayRoutes []*core_mesh.MeshGatewayRouteResource, listener *mesh_proto.MeshGateway_Listener,
+	tags map[string]string) []string {
+	var hostnames []string
+	for _, route := range gatewayRoutes {
+		if _, ok := policy.MatchSelector(tags, route.Selectors()); !ok {
+			continue
+		}
+		protocol := listener.Protocol
+		switch t := route.Spec.GetConf().GetRoute().(type) {
+		case *mesh_proto.MeshGatewayRoute_Conf_Http:
+			if protocol == mesh_proto.MeshGateway_Listener_HTTP ||
+				protocol == mesh_proto.MeshGateway_Listener_HTTPS {
+				if httpSpec := route.Spec.GetConf().GetHttp(); httpSpec != nil && len(httpSpec.Hostnames) > 0 {
+					hostnames = append(hostnames, httpSpec.Hostnames...)
+				}
+			}
+		default:
+			panic(fmt.Sprintf("Route type %T not supported for mesh gateway", t))
+		}
+	}
+	return hostnames
 }
 
 func (d *VIPsAllocator) BuildVirtualOutboundMeshView(ctx context.Context, mesh string) (*vips.VirtualOutboundMeshView, error) {
@@ -264,9 +317,17 @@ func (d *VIPsAllocator) BuildVirtualOutboundMeshView(ctx context.Context, mesh s
 		if err := d.rm.List(ctx, &gateways, store.ListByMesh(meshName)); err != nil {
 			return nil, err
 		}
+		gatewayRoutes := core_mesh.MeshGatewayRouteResourceList{}
+		if err := d.rm.List(ctx, &gatewayRoutes, store.ListByMesh(meshName)); err != nil {
+			return nil, err
+		}
+		meshDataplanes := core_mesh.DataplaneResourceList{}
+		if err := d.rm.List(ctx, &meshDataplanes, store.ListByMesh(meshName)); err != nil {
+			return nil, err
+		}
 
 		for _, gateway := range gateways.Items {
-			addFromMeshGateway(outboundSet, d.dnsSuffix, meshName, gateway)
+			addFromMeshGateway(outboundSet, d.dnsSuffix, meshName, gateway, gatewayRoutes, meshDataplanes)
 		}
 	}
 

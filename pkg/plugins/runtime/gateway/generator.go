@@ -259,6 +259,10 @@ func (g Generator) generateLDS(ctx xds_context.Context, info GatewayListenerInfo
 
 	var gatewayHosts []GatewayHost
 	for _, hostInfo := range hostInfos {
+		if info.Listener.CrossMesh && hostInfo.Host.Hostname != mesh_proto.WildcardHostname {
+			//for cross-mesh, ignore any non-wildcard hosts as there will not be any (usable) SNI available for filter chain matching
+			continue
+		}
 		gatewayHosts = append(gatewayHosts, hostInfo.Host)
 	}
 
@@ -394,10 +398,7 @@ func MakeGatewayListener(
 		hosts = append(hosts, host)
 	}
 
-	// We ignore route hostnames with cross mesh
-	if !listener.CrossMesh {
-		hosts = RedistributeWildcardRoutes(hosts)
-	}
+	hosts = RedistributeWildcardRoutes(hosts)
 
 	// Sort by reverse hostname, so that fully qualified hostnames sort
 	// before wildcard domains, and "*" is last.

@@ -1440,6 +1440,12 @@ conf:
   - port: 8080
     protocol: HTTP
     crossMesh: true
+  - port: 8081
+    protocol: HTTP
+    crossMesh: true
+    hostname: internal-cross-mesh.mesh
+    tags:
+      hostname: internal-cross-mesh.mesh
 `, `
 type: MeshGatewayRoute
 mesh: default
@@ -1464,6 +1470,89 @@ conf:
       - path:
           match: PREFIX
           value: "/echo"
+      backends:
+      - destination:
+          kuma.io/service: echo-service
+`, `
+type: MeshGatewayRoute
+mesh: default
+name: echo-service-with-hostname
+selectors:
+- match:
+    kuma.io/service: gateway-default
+selectors:
+- match:
+    kuma.io/service: gateway-default
+conf:
+  http:
+    hostnames:
+    - cross-mesh.mesh
+    rules:
+    - matches:
+      - path:
+          match: PREFIX
+          value: "/hostname-ext"
+      backends:
+      - destination:
+          kuma.io/service: external-httpbin
+    - matches:
+      - path:
+          match: PREFIX
+          value: "/hostname-echo"
+      backends:
+      - destination:
+          kuma.io/service: echo-service
+`, `
+type: MeshGatewayRoute
+mesh: default
+name: echo-service-with-hostname-and-hostname-on-listener
+selectors:
+- match:
+    kuma.io/service: gateway-default
+    hostname: internal-cross-mesh.mesh
+conf:
+  http:
+    hostnames:
+    - cross-mesh.mesh
+    rules:
+    - matches:
+      - path:
+          match: PREFIX
+          value: "/hostname-and-hostname-on-listener-no-match-ext"
+      backends:
+      - destination:
+          kuma.io/service: external-httpbin
+    - matches:
+      - path:
+          match: PREFIX
+          value: "/hostname-and-hostname-on-listener-eno-match-cho"
+      backends:
+      - destination:
+          kuma.io/service: echo-service
+`, `
+type: MeshGatewayRoute
+mesh: default
+name: echo-service-with-hostname-and-hostname-on-listener
+selectors:
+- match:
+    kuma.io/service: gateway-default
+    hostname: internal-cross-mesh.mesh
+conf:
+  http:
+    hostnames:
+    - internal-cross-mesh.mesh
+    rules:
+    - matches:
+      - path:
+          match: PREFIX
+          value: "/hostname-and-hostname-on-listener-match-ext"
+      backends:
+      - destination:
+          kuma.io/service: external-httpbin
+    - matches:
+      - path:
+          match: PREFIX
+          value: "/hostname-and-hostname-on-listener-match-echo"
       backends:
       - destination:
           kuma.io/service: echo-service
